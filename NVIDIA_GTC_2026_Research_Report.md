@@ -220,6 +220,300 @@ Agentic AI가 부상하면서 문맥 창(context window)이 수백만 토큰으�
 
 ---
 
+---
+
+## 5. 주제별 스토리지 요구사항 상세 분석
+
+### 5.1 Vera Rubin NVL72 — 학습(Training) 워크로드
+
+#### 5.1.1 메모리 계층 구조
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Vera Rubin NVL72 메모리 계층                      │
+├──────────┬──────────┬──────────┬─────────────┬──────────────────────┤
+│  계층    │ 매체     │ GPU당 용량│ 대역폭      │ 지연시간             │
+├──────────┼──────────┼──────────┼─────────────┼──────────────────────┤
+│ G1 (L1)  │ 레지스터 │ ~수 MB   │ ~수십 TB/s  │ <1 ns               │
+│ G2 (L2)  │ On-chip  │ ~수십 MB │ ~수 TB/s    │ ~수 ns               │
+│          │ SRAM     │          │             │                      │
+│ G3 (HBM) │ HBM4    │ 288 GB   │ 13~22 TB/s  │ ~100 ns              │
+│ G3.5     │ NVMe    │ 16 TB    │ 수십 GB/s   │ ~10 μs               │
+│ (ICMS)   │ Flash    │ (GPU당)  │ (RDMA)      │ (RDMA 최적화)        │
+│ G4       │ 네트워크 │ PB급     │ 수 GB/s     │ ~ms                  │
+│          │ 스토리지 │          │             │                      │
+└──────────┴──────────┴──────────┴─────────────┴──────────────────────┘
+```
+
+#### 5.1.2 학습 데이터 스토리지
+
+| 항목 | 요구사항 | 근거 |
+|------|---------|------|
+| **데이터셋 용량** | 수십 PB ~ 수백 PB | 1T+ 파라미터 모델 학습 시 토큰 수 10T+, 멀티모달 데이터 포함 |
+| **읽기 처리량** | 100+ GB/s (클러스터 전체) | GPU idle 방지를 위해 데이터 파이프라인이 연산 속도를 따라가야 함 |
+| **IOPS** | 수백만 IOPS | 소규모 랜덤 읽기 패턴 (데이터 셔플링, 증강) |
+| **매체** | NVMe SSD (3+ DWPD) | SATA 대비 3~7배 처리량, 10~100배 낮은 지연시간 |
+| **아키텍처** | 분산 병렬 파일시스템 | Lustre, GPFS, WekaFS 등 |
+
+**워크로드 특징:**
+- **순차 읽기 중심:** 학습 데이터는 에포크 단위로 전체를 순차적으로 읽음
+- **대역폭 바운드:** 높은 처리량이 핵심이며, 지연시간은 상대적으로 덜 중요
+- **데이터 불변성:** 학습 중 데이터셋은 읽기 전용 (쓰기 없음)
+- **프리페치 가능:** 다음 배치를 미리 로드하여 GPU 대기 시간 최소화
+
+#### 5.1.3 체크포인트 스토리지
+
+| 항목 | 요구사항 | 근거 |
+|------|---------|------|
+| **단일 체크포인트 크기** | 수 TB ~ 15+ TB | 1T 파라미터 모델: 가중치(~2TB FP16) + 옵티마이저 상태(~8TB) + 그래디언트 |
+| **쓰기 처리량** | 100+ GBps (버스트) | 512-GPU 클러스터에서 15TB 체크포인트를 150초 이내에 기록 |
+| **빈도** | 수 분 ~ 수 시간 간격 | 빈번할수록 장애 복구 비용 감소, 그러나 I/O 오버헤드 증가 |
+| **보존 기간** | 로컬: 수 시간 / 영구: 무기한 | 2계층 전략 — 핫(NVMe) + 콜드(S3/오브젝트 스토리지) |
+| **총 용량** | 수백 TB ~ PB급 | 다수 체크포인트 버전 보존 필요 |
+
+**워크로드 특징:**
+- **극한 버스트 쓰기:** 체크포인트 기록 시 클러스터 전체가 동시에 수 TB를 기록 → 스토리지 버스트 대역폭이 핵심
+- **3D 병렬 쓰기 패턴:** 수천 GPU가 각각 독립 파일을 생성 → 메타데이터 병목 발생 가능
+- **2계층 비동기 전략:** 로컬 NVMe에 즉시 기록 → 백그라운드에서 내구성 스토리지로 복제
+- **GPU stall 비용이 거대:** 512-GPU 클러스터가 체크포인트 I/O로 1분 멈추면, 클라우드 비용 기준 수만 달러 손실
+
+```
+체크포인트 쓰기 흐름:
+
+GPU HBM ──(PCIe 5.0)──▶ 호스트 DRAM ──(NVMe)──▶ 로컬 SSD (핫)
+                                                       │
+                                                 (백그라운드)
+                                                       ▼
+                                              영구 스토리지 (S3/Lustre)
+```
+
+---
+
+### 5.2 Vera Rubin NVL72 — 추론(Inference) 워크로드
+
+#### 5.2.1 KV 캐시 스토리지 — 가장 급격히 성장하는 스토리지 수요
+
+**KV 캐시란?**
+
+LLM이 토큰을 생성할 때마다 이전 토큰들의 Key-Value 쌍을 저장하여 재연산을 피한다. 문맥 길이에 비례하여 선형 성장하며, 동시 사용자 수에 비례하여 곱셈적으로 증가한다.
+
+**규모 산정:**
+
+| 모델 규모 | 문맥 길이 | KV 캐시 크기 (세션당) | 비고 |
+|----------|----------|---------------------|------|
+| 8B | 100K 토큰 | ~10 GB | 단일 GPU HBM 내 수용 가능 |
+| 70B | 100K 토큰 | ~40 GB | HBM 용량의 상당 부분 소비 |
+| 405B | 1M 토큰 | ~200+ GB | 다수 GPU의 HBM 소비 또는 오프로드 필수 |
+| 1T+ | 1M+ 토큰 | ~500+ GB | ICMS 오프로드 없이는 운영 불가 |
+
+**에이전틱 AI에서의 폭발적 증가:**
+
+- 에이전트 1회 호출 시 공유 컨텍스트: 시스템 프롬프트(~2,000 토큰) + 도구 정의(~5,000 토큰) + 정책 컨텍스트(~4,000 토큰) = **~11,000 토큰**
+- 하루 5,000회 에이전트 호출 시: **5,500만 토큰의 공유 컨텍스트** 재연산
+- KV 캐시 미스 비용은 히트 비용의 **10배** (Manus AI 보고)
+- 따라서 "KV 캐시 히트율"이 에이전틱 AI의 **가장 중요한 성능 지표**
+
+#### 5.2.2 ICMS (Inference Context Memory Storage) 플랫폼 상세
+
+**NVIDIA가 정의한 "G3.5" 계층:**
+
+GPU HBM(G3)과 네트워크 스토리지(G4) 사이에 위치하는 **팟 수준의 컨텍스트 메모리 계층**이다.
+
+| 항목 | 사양 |
+|------|------|
+| **GPU당 컨텍스트 메모리** | 16 TB |
+| **랙당 용량** | 72 GPU × 16 TB = **1,152 TB** |
+| **SuperPOD 총 용량** | **18,432 TB (~18 PB)** |
+| **스토리지 인클로저 구성** | 4× BlueField-4 DPU + 600 TB 플래시 / 인클로저 |
+| **인클로저 수 (SuperPOD)** | 36× 2U 인클로저 |
+| **네트워크** | Spectrum-X Ethernet, 800 Gb/s RDMA |
+| **프로토콜** | NVMe-oF (NVMe over Fabrics) |
+| **성능 향상** | 토큰/초 5배, 전력 효율 5배 (전통 스토리지 대비) |
+
+**BlueField-4 DPU의 역할:**
+
+| 기능 | 상세 |
+|------|------|
+| **KV 캐시 I/O 플레인** | NVMe-oF 및 RDMA 프로토콜을 라인 레이트로 처리 |
+| **하드웨어 가속 KV 배치** | 메타데이터 오버헤드 제거, 호스트 CPU 개입 없이 DPU가 직접 NVMe 디바이스 접근 |
+| **인라인 암호화** | 800 Gb/s 대역폭에서 CPU 사이클 소비 없이 암호화/무결성 검증 |
+| **프로세서** | 64코어 NVIDIA Grace CPU + 고대역폭 LPDDR |
+| **보안** | ASTRA (Advanced Secure Trusted Resource Architecture) |
+
+**워크로드 특징:**
+- **임시적(Ephemeral) 데이터:** KV 캐시는 영구 저장이 아닌 재연산 가능한 임시 데이터 → 내구성보다 성능과 용량 우선
+- **읽기/쓰기 혼합:** 프리필 시 대량 쓰기 → 디코드 시 반복 읽기 → 세션 종료 시 삭제
+- **공유 접근:** 여러 GPU가 동일 KV 캐시를 참조 (멀티 에이전트 시스템)
+- **지연시간 민감:** ms 단위 접근 필요 (기존 엔터프라이즈 스토리지의 ms 지연은 추론 stall 유발)
+- **NAND 플래시에 최적:** 대용량 + 중간 대역폭 + 중간 지연시간 요구 → DRAM보다 경제적, HDD보다 빠름
+
+```
+ICMS 데이터 흐름:
+
+사용자 요청 ──▶ 프리필 (CPX) ──▶ KV 캐시 생성 ──▶ ICMS에 저장
+                                                       │
+다음 요청 ──▶ ICMS에서 KV 캐시 로드 ──▶ 디코드 (Rubin GPU)
+                    │
+                (캐시 히트 시 프리필 생략 → 10배 비용 절감)
+```
+
+---
+
+### 5.3 Rubin CPX — 장문맥 프리필 전용
+
+#### 5.3.1 아키텍처적 차별점
+
+CPX는 **프리필(Prefill) 전용** GPU로, HBM 대신 GDDR7을 채택한 최초의 CUDA GPU이다.
+
+| 항목 | Rubin (R200) | Rubin CPX | 비교 |
+|------|-------------|-----------|------|
+| **메모리 종류** | HBM4 | GDDR7 | 비용 1/5 |
+| **GPU당 용량** | 288 GB | 128 GB | 절반 이하 |
+| **대역폭** | 13~22 TB/s | 2 TB/s | 1/7~1/11 |
+| **연산 성능** | 50 PFLOPS FP4 | 30 PFLOPS FP4 | 60% |
+| **Attention 가속** | 기본 | 3배 가속 (vs GB300) | 프리필 최적화 |
+| **비디오 코덱** | 없음 | HW 인코더/디코더 내장 | 멀티모달 지원 |
+
+#### 5.3.2 스토리지 요구사항
+
+| 항목 | 요구사항 | 근거 |
+|------|---------|------|
+| **모델 가중치 로딩** | 128 GB GDDR7 내 수용 | MoE 모델은 활성 파라미터만 로드하므로 GDDR7으로 충분 |
+| **KV 캐시 출력** | 대량 쓰기 → ICMS로 전송 | 프리필 결과를 ICMS에 기록, 디코드 GPU가 읽음 |
+| **입력 데이터** | 장문맥 텍스트/멀티모달 데이터 | 100만+ 토큰, 비디오/이미지 인코딩 포함 |
+| **네트워크 대역폭** | NVLink 6 (260 TB/s 총합) | KV 캐시를 디코드 GPU로 전송하는 경로 |
+
+**워크로드 특징:**
+- **연산 바운드(Compute-Bound):** 프리필은 모든 입력 토큰을 한 번에 처리 → GPU 연산 능력이 병목이지 메모리 대역폭이 아님
+- **대역폭 요구 낮음:** HBM의 1/7 대역폭(2 TB/s)으로도 충분 → GDDR7로 비용 80% 절감
+- **대량 KV 캐시 생성:** 100만 토큰 프리필 시 수백 GB의 KV 캐시 생성 → 이를 ICMS에 빠르게 기록해야 함
+- **일회성 읽기:** 입력 데이터를 한 번만 읽고 처리 → 캐싱 전략보다 스트리밍 처리량이 중요
+
+```
+CPX 프리필 워크로드 흐름:
+
+장문맥 입력 ──▶ [CPX: 128GB GDDR7] ──▶ KV 캐시 생성
+(100만+ 토큰)    (30 PFLOPS FP4)         (수백 GB)
+                                           │
+                                     (NVLink 6 / ICMS)
+                                           ▼
+                                   [Rubin GPU: HBM4]
+                                    디코드 (토큰 생성)
+```
+
+---
+
+### 5.4 LPX (Groq LPU) — 초저지연 추론
+
+#### 5.4.1 스토리지 아키텍처의 근본적 차이
+
+LPU는 **외장 메모리가 전혀 없다.** 모든 모델 가중치가 온칩 SRAM에 저장된다.
+
+| 항목 | GPU (H100) | LPU (Groq) | 차이 |
+|------|-----------|-----------|------|
+| **주 메모리** | HBM3 80GB (외장) | SRAM 230MB (온칩) | 용량 348배 차이 |
+| **내부 대역폭** | 3.35 TB/s | 80 TB/s | LPU 24배 우위 |
+| **메모리 접근 에너지** | 높음 (HBM 접근) | 낮음 (온칩 SRAM) | 에너지 10배 절감 |
+| **외부 스토리지 의존** | 모델 로딩 시 필요 | 모델 분산 로딩 필요 | 둘 다 필요하나 패턴 다름 |
+
+#### 5.4.2 모델 크기별 LPU 요구량과 스토리지 연계
+
+| 모델 크기 | 정밀도 | 가중치 크기 | 필요 LPU 수 | 모델 로딩 소스 |
+|----------|--------|-----------|-----------|--------------|
+| 1B | FP16 | 2 GB | ~9개 | 로컬 NVMe에서 로드 |
+| 7B | FP16 | 14 GB | ~61개 | 로컬 NVMe에서 로드 |
+| 8B | INT8 | 8 GB | ~35개 | 로컬 NVMe에서 로드 |
+| 70B | FP16 | 140 GB | ~576개 | 분산 스토리지에서 병렬 로드 |
+| 405B | FP16 | 810 GB | ~3,522개 | 대규모 분산 스토리지 필수 |
+
+#### 5.4.3 스토리지 요구사항
+
+| 항목 | 요구사항 | 근거 |
+|------|---------|------|
+| **모델 가중치 저장** | 로컬 NVMe 또는 분산 스토리지 | 수백~수천 LPU에 가중치를 분산 로드해야 함 |
+| **모델 로딩 속도** | 초고속 필요 (수 초 이내) | 모델 교체(hot-swap) 시 서비스 중단 최소화 |
+| **KV 캐시** | 온칩 SRAM 내에서 처리 | 외부 KV 캐시 오프로드 불필요 (소형 모델이므로) |
+| **컨텍스트 길이 제한** | 수천~수만 토큰 | SRAM 용량 제약으로 장문맥 불가 |
+| **양자화 모델 저장** | INT8/FP8 양자화 모델 | TruePoint Numerics로 2~4배 용량 절감 |
+
+**워크로드 특징:**
+- **스토리지 접근이 극히 드묾:** 모델 로딩 후에는 외부 스토리지 접근이 거의 없음
+- **모델 로딩이 유일한 I/O 이벤트:** 가중치를 SRAM에 로드하면, 이후 추론은 100% 온칩에서 완결
+- **양자화가 스토리지 부담을 줄임:** FP16 → INT8 전환으로 저장 용량 절반, LPU 수도 절반으로 감소
+- **콜드 스타트 문제:** 수백~수천 LPU에 모델을 분산 로드하는 시간이 서비스 가용성의 핵심 변수
+- **멀티 모델 서빙:** 여러 모델을 빠르게 교체하려면 스토리지에서의 모델 로딩 속도가 중요
+
+```
+LPU 모델 로딩 vs 추론:
+
+[로딩 단계] ── 외부 NVMe ──(분산)──▶ LPU#1 SRAM (230MB 슬라이스)
+                               ──▶ LPU#2 SRAM (230MB 슬라이스)
+                               ──▶ ...
+                               ──▶ LPU#576 SRAM (230MB 슬라이스)
+
+[추론 단계] ── 입력 토큰 ──▶ LPU 체인 (순차 처리) ──▶ 출력 토큰
+                          (외부 스토리지 접근 없음)
+                          (80 TB/s 내부 대역폭)
+```
+
+---
+
+### 5.5 학습 vs 추론 스토리지 요구사항 비교표
+
+| 특성 | 학습 (Training) | 추론 — 디코드 (Inference) | 추론 — 프리필 (Prefill) | LPX 추론 (LPU) |
+|------|----------------|------------------------|----------------------|----------------|
+| **주 메모리** | HBM4 (288GB) | HBM4 (288GB) | GDDR7 (128GB) | SRAM (230MB×N) |
+| **데이터 패턴** | 순차 읽기 + 버스트 쓰기 | 랜덤 읽기/쓰기 혼합 | 순차 읽기 → 대량 쓰기 | 로딩 시에만 순차 읽기 |
+| **외부 스토리지 용량** | 수십~수백 PB | 16 TB/GPU (ICMS) | 입력 데이터 크기 의존 | 모델 저장소 수 TB |
+| **대역폭 요구** | 100+ GB/s (지속) | 수십 GB/s (RDMA) | 중간 (연산 바운드) | 로딩 시에만 높음 |
+| **지연시간 민감도** | 낮음 (프리페치 가능) | **매우 높음** (μs 단위) | 중간 | N/A (온칩 처리) |
+| **데이터 지속성** | 영구 (체크포인트) | 임시 (KV 캐시) | 임시 (KV 캐시) | 없음 (SRAM 휘발) |
+| **SSD 내구성 요구** | 3+ DWPD (높음) | 1~3 DWPD (중간) | 낮음 (읽기 중심) | 낮음 |
+| **확장 단위** | 클러스터 전체 | 팟(Pod) 단위 | 랙 단위 | 모델 크기 비례 |
+
+---
+
+### 5.6 NAND 플래시 / SSD 시장에 대한 함의
+
+#### 5.6.1 수요 폭발 포인트
+
+| 드라이버 | GPU당 SSD 용량 | 근거 |
+|----------|--------------|------|
+| **ICMS (KV 캐시)** | **16 TB / GPU** | Jensen Huang 키노트에서 직접 언급 |
+| **체크포인트** | 2~4 TB / GPU (분산) | 15TB 체크포인트 ÷ 수백 GPU |
+| **학습 데이터 캐시** | 4~8 TB / 서버 | 로컬 NVMe 캐시 계층 |
+| **합계** | **~20+ TB / GPU** | ICMS가 지배적 |
+
+**산술적 의미:**
+- Vera Rubin NVL72 한 랙: 72 GPU × 16 TB = **1,152 TB의 ICMS 플래시**
+- SuperPOD (36 인클로저): **~18 PB의 플래시**
+- 1GW 규모 AI 팩토리: 수만 GPU → **수백 PB ~ EB급 플래시 수요**
+
+#### 5.6.2 SSD 특성 요구사항
+
+| 특성 | ICMS (KV 캐시) 용 | 체크포인트 용 | 학습 데이터 용 |
+|------|-----------------|-------------|--------------|
+| **용량** | 15.36~30.72 TB | 7.68~15.36 TB | 15.36~30.72 TB |
+| **인터페이스** | NVMe Gen5/Gen6 | NVMe Gen5 | NVMe Gen5 |
+| **순차 읽기** | 14+ GB/s | 7+ GB/s | 14+ GB/s |
+| **순차 쓰기** | 10+ GB/s | 10+ GB/s (버스트) | 낮음 |
+| **내구성 (DWPD)** | 1~3 DWPD | 3+ DWPD | 0.5~1 DWPD |
+| **프로토콜** | NVMe-oF (RDMA) | 로컬 NVMe | Lustre/GPFS |
+| **폼팩터** | E1.S / E3.S | U.2 / E1.S | U.2 / E1.S |
+| **핵심 차별점** | 일관된 저지연 QoS | 버스트 쓰기 내구성 | 순차 읽기 처리량 |
+
+#### 5.6.3 시장 전망
+
+1. **ICMS가 AI SSD 수요의 게임 체인저다.** GPU당 16TB라는 수치는 전례 없는 규모이며, 이는 기존의 학습 데이터 저장 수요를 압도한다. NAND 플래시 업계는 이 수요를 충족하기 위해 QLC/PLC SSD의 대용량화와 NVMe-oF 최적화에 주력해야 한다.
+
+2. **엔터프라이즈 SSD의 요구사항이 분화된다.** KV 캐시용(저지연 QoS), 체크포인트용(버스트 쓰기 내구성), 데이터용(순차 읽기 처리량)으로 워크로드가 명확히 분리되어, 단일 SSD 제품으로 모든 요구를 충족하기 어려워진다.
+
+3. **NVMe-oF가 AI 스토리지의 표준 프로토콜로 자리잡는다.** BlueField-4 DPU가 NVMe-oF를 라인 레이트로 처리함으로써, 호스트 CPU 오버헤드 없이 GPU에서 원격 플래시에 직접 접근하는 아키텍처가 일반화된다.
+
+4. **플래시 가격 상승 압력.** AI 데이터센터의 플래시 수요 급증(GPU당 20TB+)과 DRAM의 AI 전환에 의한 NAND 투자 축소가 겹치면서, 2026~2027년 NAND 플래시 가격 상승이 예상된다.
+
+---
+
 ## 출처
 
 - [NVIDIA GTC 2026 공식 사이트](https://www.nvidia.com/gtc/)
@@ -244,3 +538,16 @@ Agentic AI가 부상하면서 문맥 창(context window)이 수백만 토큰으�
 - [LIQID - CXL Memory Pooling at GTC](https://finance.yahoo.com/news/liqid-demonstrate-gpu-cxl-memory-170200758.html)
 - [TechCrunch - GTC 2026 Keynote](https://techcrunch.com/2026/03/12/how-to-watch-jensen-huangs-nvidia-gtc-2026-keynote/)
 - [The Register - GTC 2026 Preview](https://www.theregister.com/2026/03/13/nvidia_gtc_2026_preview_tobias_mann_register/)
+- [NVIDIA Developer Blog - Rubin CPX Long-Context Inference](https://developer.nvidia.com/blog/nvidia-rubin-cpx-accelerates-inference-performance-and-efficiency-for-1m-token-context-workloads/)
+- [NVIDIA Developer Blog - BlueField-4 ICMS](https://developer.nvidia.com/blog/introducing-nvidia-bluefield-4-powered-inference-context-memory-storage-platform-for-the-next-frontier-of-ai/)
+- [NVIDIA Newsroom - BlueField-4 AI-Native Storage](https://nvidianews.nvidia.com/news/nvidia-bluefield-4-powers-new-class-of-ai-native-storage-infrastructure-for-the-next-frontier-of-ai)
+- [NVIDIA Developer Blog - Vera Rubin Platform](https://developer.nvidia.com/blog/inside-the-nvidia-rubin-platform-six-new-chips-one-ai-supercomputer/)
+- [TechTarget - NVIDIA KV Cache Enterprise Storage](https://www.techtarget.com/searchStorage/news/366637161/Nvidias-new-KV-cache-makes-waves-in-enterprise-storage)
+- [Blocks and Files - NVIDIA KV Cache NVMe SSD](https://blocksandfiles.com/2026/01/06/nvidia-standardizes-gpu-cluster-kv-cache-offload-to-nvme-ssds/)
+- [VAST Data - NVIDIA Inference Partnership](https://www.vastdata.com/blog/more-inference-less-infrastructure-vast-nvidia)
+- [Vik's Newsletter - Context Memory Storage Tokenomics](https://www.viksnewsletter.com/p/context-memory-storage-tokenomics)
+- [Tom's Hardware - Vera Rubin Platform In Depth](https://www.tomshardware.com/pc-components/gpus/nvidias-vera-rubin-platform-in-depth-inside-nvidias-most-complex-ai-and-hpc-platform-to-date)
+- [VideoCardz - Rubin CPX 128GB GDDR7](https://videocardz.com/newz/nvidia-rubin-cpx-gpu-to-feature-128gb-gddr7-memory-launches-end-of-2026)
+- [Groq - Inside the LPU Architecture](https://groq.com/blog/inside-the-lpu-deconstructing-groq-speed)
+- [Computer Weekly - Storage Requirements for AI](https://www.computerweekly.com/feature/What-are-the-storage-requirements-for-AI-training-and-inference)
+- [AWS - Checkpoint Storage Architecture](https://aws.amazon.com/blogs/storage/architecting-scalable-checkpoint-storage-for-large-scale-ml-training-on-aws/)
